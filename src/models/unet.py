@@ -6,13 +6,25 @@ import torch.nn.functional as F
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
+
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1
+            ),
+            nn.GroupNorm(8, out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1
+            ),
+            nn.GroupNorm(8, out_channels),
+            nn.ReLU(inplace=True)
         )
 
     def forward(self, x):
@@ -35,22 +47,49 @@ class UNet(nn.Module):
         self.dec2 = DoubleConv(64 + 32, 32)
         self.dec1 = DoubleConv(32 + 16, 16)
 
-        self.output = nn.Conv2d(16, 1, kernel_size=1)
+        self.output = nn.Conv2d(
+            16,
+            1,
+            kernel_size=1
+        )
 
     def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
+        enc1 = self.enc1(x)
+        enc2 = self.enc2(self.pool(enc1))
+        enc3 = self.enc3(self.pool(enc2))
 
-        b = self.bottleneck(self.pool(e3))
+        bottleneck = self.bottleneck(
+            self.pool(enc3)
+        )
 
-        d3 = F.interpolate(b, size=e3.shape[-2:], mode="bilinear", align_corners=False)
-        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        dec3 = F.interpolate(
+            bottleneck,
+            size=enc3.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+        dec3 = self.dec3(
+            torch.cat([dec3, enc3], dim=1)
+        )
 
-        d2 = F.interpolate(d3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        dec2 = F.interpolate(
+            dec3,
+            size=enc2.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+        dec2 = self.dec2(
+            torch.cat([dec2, enc2], dim=1)
+        )
 
-        d1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        dec1 = F.interpolate(
+            dec2,
+            size=enc1.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+        dec1 = self.dec1(
+            torch.cat([dec1, enc1], dim=1)
+        )
 
-        return self.output(d1)
+        return self.output(dec1)

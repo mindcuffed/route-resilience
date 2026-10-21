@@ -8,7 +8,10 @@ from src.models.unet import UNet
 
 def dice_loss(logits, targets):
     probabilities = torch.sigmoid(logits)
-    intersection = (probabilities * targets).sum(dim=(1, 2, 3))
+
+    intersection = (
+        probabilities * targets
+    ).sum(dim=(1, 2, 3))
 
     score = (
         (2 * intersection + 1.0)
@@ -27,8 +30,17 @@ def main():
 
     manifest = r"data\processed\manifest.csv"
 
-    train_dataset = RoadDataset(manifest, split="train", size=512)
-    validation_dataset = RoadDataset(manifest, split="val", size=256)
+    train_dataset = RoadDataset(
+        manifest,
+        split="train",
+        size=512
+    )
+
+    validation_dataset = RoadDataset(
+        manifest,
+        split="val",
+        size=512
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -45,6 +57,7 @@ def main():
     )
 
     device = torch.device("cpu")
+
     model = UNet().to(device)
 
     optimizer = torch.optim.Adam(
@@ -53,12 +66,12 @@ def main():
     )
 
     bce = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor([20.0])
+        pos_weight=torch.tensor([2.0])
     )
 
     best_validation_loss = float("inf")
 
-    for epoch in range(1, 21):
+    for epoch in range(1, 31):
         model.train()
         training_loss = 0.0
 
@@ -67,6 +80,7 @@ def main():
             masks = masks.to(device)
 
             optimizer.zero_grad()
+
             predictions = model(images)
 
             loss = (
@@ -100,17 +114,19 @@ def main():
         validation_loss /= len(validation_loader)
 
         print(
-            f"Epoch {epoch}/5 | "
+            f"Epoch {epoch}/30 | "
             f"Train Loss: {training_loss:.4f} | "
             f"Validation Loss: {validation_loss:.4f}"
         )
 
         if validation_loss < best_validation_loss:
             best_validation_loss = validation_loss
+
             torch.save(
                 model.state_dict(),
                 r"outputs\unet_best.pt"
             )
+
             print("Best model saved")
 
 

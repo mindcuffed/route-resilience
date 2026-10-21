@@ -1,19 +1,48 @@
 import numpy as np
 
 from PIL import Image, ImageDraw
+from scipy.spatial import cKDTree
 from skimage.measure import label
-from skimage.morphology import skeletonize
+from skimage.morphology import closing, disk, skeletonize
 
 
-MASK_PATH = r"data\processed\masks\AOI_2_Vegas_img1454.png"
+INPUT_PATH = r"outputs\predicted_tiled_mask.png"
+OUTPUT_PATH = r"outputs\reconstruction_repaired.png"
 
-ORIGINAL_OUTPUT = r"outputs\reconstruction_original.png"
-OCCLUDED_OUTPUT = r"outputs\reconstruction_occluded.png"
-REPAIRED_OUTPUT = r"outputs\reconstruction_repaired.png"
+MIN_COMPONENT_SIZE = 100
+MAX_GAP = 120
+MAX_CONNECTIONS = 100
+DIRECTION_THRESHOLD = 0.20
+LOOK_AHEAD = 15
+LINE_WIDTH = 3
 
 
-def get_neighbors(skeleton, y, x):
-    neighbors = []
+def filter_small_components(mask):
+    labels = label(
+        mask,
+        connectivity=2
+    )
+
+    filtered = np.zeros_like(mask)
+
+    component_ids, sizes = np.unique(
+        labels,
+        return_counts=True
+    )
+
+    for component_id, size in zip(
+        component_ids,
+        sizes
+    ):
+        if component_id != 0 and size >= MIN_COMPONENT_SIZE:
+            filtered[labels == component_id] = True
+
+    return filtered
+
+
+def get_neighbours(skeleton, y, x):
+    height, width = skeleton.shape
+    neighbours = []
 
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
@@ -24,212 +53,261 @@ def get_neighbors(skeleton, y, x):
             nx = x + dx
 
             if (
-                0 <= ny < skeleton.shape[0]
-                and 0 <= nx < skeleton.shape[1]
+                0 <= ny < height
+                and 0 <= nx < width
                 and skeleton[ny, nx]
             ):
-                neighbors.append((ny, nx))
+                neighbours.append((ny, nx))
 
-    return neighbors
-
-
-def find_endpoints(skeleton, component_labels):
-    endpoints = []
-
-    pixels = np.argwhere(skeleton)
-
-    for y, x in pixels:
-        y = int(y)
-        x = int(x)
-
-        neighbors = get_neighbors(skeleton, y, x)
-
-        if len(neighbors) == 1:
-            neighbor_y, neighbor_x = neighbors[0]
-
-            direction = np.array(
-                [
-                    y - neighbor_y,
-                    x - neighbor_x
-                ],
-                dtype=float
-            )
-
-            length = np.linalg.norm(direction)
-
-            if length > 0:
-                direction = direction / length
-
-                endpoints.append(
-                    (
-                        (y, x),
-                        direction,
-                        int(component_labels[y, x])
-                    )
-                )
-
-    return endpoints
+    return neighbours
 
 
-def repair_gaps(mask, max_gap=250):
+def trace_direction(skeleton, y, x):
+    start_y = y
+    start_x = x
+
+    previous = None
+    current = (y, x)
+
+    for _ in range(LOOK_AHEAD):
+        neighbours = get_neighbours(
+            skeleton,
+            current[0],
+            current[1]
+        )
+
+        if previous is not None:
+            neighbours = [
+                point for point in neighbours
+                if point != previous
+            ]
+
+        if not neighbours:
+            break
+
+        next_point = neighbours[0]
+
+        previous = current
+        current = next_point
+
+    direction = np.array(
+        [
+            start_x - current[1],
+            start_y - current[0]
+        ],
+        dtype=float
+    )
+
+    length = np.linalg.norm(direction)
+
+    if length == 0:
+        return None
+
+    return direction / length
+
+
+def get_endpoint_data(mask, labels):
     skeleton = skeletonize(mask)
+    endpoint_data = []
 
-    component_labels = label(
-        skeleton,
-        connectivity=2
-    )
+    skeleton_points = np.argwhere(skeleton)
 
-    endpoints = find_endpoints(
-        skeleton,
-        component_labels
-    )
+    for y, x in skeleton_points:
+        neighbours = get_neighbours(
+            skeleton,
+            int(y),
+            int(x)
+        )
 
-    candidates = []
-
-    for first in range(len(endpoints)):
-        point_a, direction_a, component_a = endpoints[first]
-
-        for second in range(first + 1, len(endpoints)):
-            point_b, direction_b, component_b = endpoints[second]
-
-            if component_a == component_b:
-                continue
-
-            vector = np.array(
-                [
-                    point_b[0] - point_a[0],
-                    point_b[1] - point_a[1]
-                ],
-                dtype=float
-            )
-
-            distance = np.linalg.norm(vector)
-
-            if distance == 0 or distance > max_gap:
-                continue
-
-            unit_vector = vector / distance
-
-            alignment_a = np.dot(
-                direction_a,
-                unit_vector
-            )
-
-            alignment_b = np.dot(
-                direction_b,
-                -unit_vector
-            )
-
-            if alignment_a < 0.5 or alignment_b < 0.5:
-                continue
-
-            score = (
-                (alignment_a + alignment_b) / 2
-                - distance / max_gap
-            )
-
-            candidates.append(
-                (
-                    score,
-                    first,
-                    second,
-                    point_a,
-                    point_b,
-                    distance
-                )
-            )
-
-    candidates.sort(reverse=True)
-
-    repaired = (mask * 255).astype(np.uint8)
-    repaired_image = Image.fromarray(repaired)
-    drawer = ImageDraw.Draw(repaired_image)
-
-    used_endpoints = set()
-    connections = []
-
-    for (
-        score,
-        first,
-        second,
-        point_a,
-        point_b,
-        distance
-    ) in candidates:
-        if first in used_endpoints or second in used_endpoints:
+        if len(neighbours) != 1:
             continue
 
-        y1, x1 = point_a
-        y2, x2 = point_b
+        component_id = labels[y, x]
 
-        drawer.line(
-            [(x1, y1), (x2, y2)],
-            fill=255,
-            width=5
+        if component_id == 0:
+            continue
+
+        direction = trace_direction(
+            skeleton,
+            int(y),
+            int(x)
         )
 
-        used_endpoints.add(first)
-        used_endpoints.add(second)
+        if direction is not None:
+            endpoint_data.append(
+                {
+                    "x": int(x),
+                    "y": int(y),
+                    "component": int(component_id),
+                    "direction": direction
+                }
+            )
 
-        connections.append(
-            {
-                "start": point_a,
-                "end": point_b,
-                "distance": distance,
-                "score": score
-            }
+    return endpoint_data
+
+
+def find_best_connection(endpoint_data):
+    if len(endpoint_data) < 2:
+        return None
+
+    points = np.array(
+        [
+            [item["x"], item["y"]]
+            for item in endpoint_data
+        ],
+        dtype=float
+    )
+
+    tree = cKDTree(points)
+    candidate_pairs = tree.query_pairs(MAX_GAP)
+
+    best_connection = None
+    best_score = -float("inf")
+
+    for first_index, second_index in candidate_pairs:
+        first = endpoint_data[first_index]
+        second = endpoint_data[second_index]
+
+        if first["component"] == second["component"]:
+            continue
+
+        difference = np.array(
+            [
+                second["x"] - first["x"],
+                second["y"] - first["y"]
+            ],
+            dtype=float
         )
 
-    return np.asarray(repaired_image) > 0, connections
+        distance = np.linalg.norm(difference)
+
+        if distance == 0:
+            continue
+
+        connection_direction = difference / distance
+
+        alignment_first = np.dot(
+            first["direction"],
+            connection_direction
+        )
+
+        alignment_second = np.dot(
+            second["direction"],
+            -connection_direction
+        )
+
+        if (
+            alignment_first < DIRECTION_THRESHOLD
+            or alignment_second < DIRECTION_THRESHOLD
+        ):
+            continue
+
+        score = (
+            alignment_first
+            + alignment_second
+            - distance / MAX_GAP
+        )
+
+        if score > best_score:
+            best_score = score
+            best_connection = (
+                (first["x"], first["y"]),
+                (second["x"], second["y"]),
+                distance
+            )
+
+    return best_connection
 
 
 def main():
-    original = np.asarray(
-        Image.open(MASK_PATH).convert("L")
+    mask = np.asarray(
+        Image.open(INPUT_PATH).convert("L")
     ) > 0
 
-    original_image = Image.fromarray(
-        (original * 255).astype(np.uint8)
+    original_pixels = int(mask.sum())
+
+    mask = filter_small_components(mask)
+
+    mask = closing(
+        mask,
+        disk(2)
     )
 
-    original_image.save(ORIGINAL_OUTPUT)
-
-    occluded_image = original_image.copy()
-    drawer = ImageDraw.Draw(occluded_image)
-
-    drawer.ellipse(
-        (100, 150, 500, 600),
-        fill=0
-    )
-
-    occluded = np.asarray(occluded_image) > 0
-    occluded_image.save(OCCLUDED_OUTPUT)
-
-    before_components = label(
-        skeletonize(occluded),
+    labels = label(
+        mask,
         connectivity=2
-    ).max()
-
-    repaired, connections = repair_gaps(occluded)
-
-    repaired_image = Image.fromarray(
-        (repaired * 255).astype(np.uint8)
     )
 
-    repaired_image.save(REPAIRED_OUTPUT)
+    components_before = int(labels.max())
+    connections_created = 0
 
-    after_components = label(
-        skeletonize(repaired),
-        connectivity=2
-    ).max()
+    for _ in range(MAX_CONNECTIONS):
+        labels = label(
+            mask,
+            connectivity=2
+        )
 
-    print("Original road pixels:", int(original.sum()))
-    print("Occluded road pixels:", int(occluded.sum()))
-    print("Repaired road pixels:", int(repaired.sum()))
-    print("Components before repair:", int(before_components))
-    print("Components after repair:", int(after_components))
-    print("Connections created:", len(connections))
-    print("Saved:", REPAIRED_OUTPUT)
+        endpoint_data = get_endpoint_data(
+            mask,
+            labels
+        )
+
+        connection = find_best_connection(
+            endpoint_data
+        )
+
+        if connection is None:
+            print("No more valid connections found.")
+            break
+
+        first, second, distance = connection
+
+        repaired_image = Image.fromarray(
+            (mask.astype(np.uint8) * 255),
+            mode="L"
+        )
+
+        draw = ImageDraw.Draw(
+            repaired_image
+        )
+
+        draw.line(
+            [first, second],
+            fill=255,
+            width=LINE_WIDTH
+        )
+
+        mask = np.asarray(
+            repaired_image
+        ) > 0
+
+        connections_created += 1
+
+        if connections_created % 10 == 0:
+            print(
+                f"Connections created: "
+                f"{connections_created}"
+            )
+
+    components_after = int(
+        label(
+            mask,
+            connectivity=2
+        ).max()
+    )
+
+    Image.fromarray(
+        (mask.astype(np.uint8) * 255),
+        mode="L"
+    ).save(OUTPUT_PATH)
+
+    print()
+    print("Original predicted pixels:", original_pixels)
+    print("Repaired predicted pixels:", int(mask.sum()))
+    print("Components before repair:", components_before)
+    print("Components after repair:", components_after)
+    print("Connections created:", connections_created)
+    print("Saved:", OUTPUT_PATH)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,9 @@ import random
 import numpy as np
 import rasterio
 import torch
+
 from PIL import Image
+from skimage.morphology import dilation, disk
 from torch.utils.data import Dataset
 
 
@@ -69,10 +71,17 @@ class RoadDataset(Dataset):
         image = np.moveaxis(image, 0, -1)
 
         low = np.percentile(
-            image, 2, axis=(0, 1), keepdims=True
+            image,
+            2,
+            axis=(0, 1),
+            keepdims=True
         )
+
         high = np.percentile(
-            image, 98, axis=(0, 1), keepdims=True
+            image,
+            98,
+            axis=(0, 1),
+            keepdims=True
         )
 
         image = np.clip(
@@ -85,6 +94,11 @@ class RoadDataset(Dataset):
             Image.open(row["mask_path"]).convert("L")
         )
 
+        mask = (
+            dilation(mask > 0, disk(3))
+            .astype(np.uint8) * 255
+        )
+
         height, width = mask.shape
 
         if (
@@ -93,8 +107,15 @@ class RoadDataset(Dataset):
             and width >= self.size
         ):
             for attempt in range(20):
-                top = random.randint(0, height - self.size)
-                left = random.randint(0, width - self.size)
+                top = random.randint(
+                    0,
+                    height - self.size
+                )
+
+                left = random.randint(
+                    0,
+                    width - self.size
+                )
 
                 image_crop = image[
                     top:top + self.size,
@@ -128,7 +149,8 @@ class RoadDataset(Dataset):
         ).permute(2, 0, 1).float() / 255.0
 
         mask = torch.from_numpy(
-            (np.asarray(mask).copy() > 0).astype(np.float32)
+            (np.asarray(mask).copy() > 0)
+            .astype(np.float32)
         ).unsqueeze(0)
 
         if self.split == "train":
@@ -140,6 +162,7 @@ class RoadDataset(Dataset):
                 image = torch.flip(image, dims=[1])
                 mask = torch.flip(mask, dims=[1])
 
-            image = add_occlusion(image)
+            # Enable this later for occlusion training.
+            # image = add_occlusion(image)
 
         return image, mask
