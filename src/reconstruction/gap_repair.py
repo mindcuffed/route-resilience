@@ -1,43 +1,49 @@
-import numpy as np
+import csv
+import math
 
+import numpy as np
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
+from skimage.draw import line
 from skimage.measure import label
-from skimage.morphology import closing, disk, skeletonize
+from skimage.morphology import closing, disk, remove_small_objects, skeletonize
 
 
-INPUT_PATH = r"outputs\predicted_tiled_mask.png"
-OUTPUT_PATH = r"outputs\reconstruction_repaired.png"
+INPUT_MASK = r"outputs\predicted_tiled_mask.png"
+INPUT_PROBABILITY = r"outputs\predicted_tiled_probability.npy"
+
+OUTPUT_MASK = r"outputs\reconstruction_repaired.png"
+OUTPUT_CONNECTIONS = r"outputs\accepted_connections.csv"
 
 MIN_COMPONENT_SIZE = 100
 MAX_GAP = 120
 MAX_CONNECTIONS = 100
+MIN_REPAIR_SCORE = 0.65
 DIRECTION_THRESHOLD = 0.20
 LOOK_AHEAD = 15
 LINE_WIDTH = 3
 
 
+def load_probability(mask):
+    try:
+        probability = np.load(INPUT_PROBABILITY)
+
+        if probability.shape != mask.shape:
+            print("Probability map shape mismatch. Using binary mask confidence.")
+            return mask.astype(np.float32)
+
+        return np.clip(probability.astype(np.float32), 0.0, 1.0)
+
+    except FileNotFoundError:
+        print("Probability map not found. Using binary mask confidence.")
+        return mask.astype(np.float32)
+
+
 def filter_small_components(mask):
-    labels = label(
-        mask,
-        connectivity=2
+    return remove_small_objects(
+        mask.astype(bool),
+        max_size=MIN_COMPONENT_SIZE
     )
-
-    filtered = np.zeros_like(mask)
-
-    component_ids, sizes = np.unique(
-        labels,
-        return_counts=True
-    )
-
-    for component_id, size in zip(
-        component_ids,
-        sizes
-    ):
-        if component_id != 0 and size >= MIN_COMPONENT_SIZE:
-            filtered[labels == component_id] = True
-
-    return filtered
 
 
 def get_neighbours(skeleton, y, x):
@@ -63,11 +69,9 @@ def get_neighbours(skeleton, y, x):
 
 
 def trace_direction(skeleton, y, x):
-    start_y = y
-    start_x = x
-
+    start = (y, x)
     previous = None
-    current = (y, x)
+    current = start
 
     for _ in range(LOOK_AHEAD):
         neighbours = get_neighbours(
@@ -86,14 +90,13 @@ def trace_direction(skeleton, y, x):
             break
 
         next_point = neighbours[0]
-
         previous = current
         current = next_point
 
     direction = np.array(
         [
-            start_x - current[1],
-            start_y - current[0]
+            start[1] - current[1],
+            start[0] - current[0]
         ],
         dtype=float
     )
@@ -110,35 +113,36 @@ def get_endpoint_data(mask, labels):
     skeleton = skeletonize(mask)
     endpoint_data = []
 
-    skeleton_points = np.argwhere(skeleton)
+    for y, x in np.argwhere(skeleton):
+        y = int(y)
+        x = int(x)
 
-    for y, x in skeleton_points:
         neighbours = get_neighbours(
             skeleton,
-            int(y),
-            int(x)
+            y,
+            x
         )
 
         if len(neighbours) != 1:
             continue
 
-        component_id = labels[y, x]
+        component_id = int(labels[y, x])
 
         if component_id == 0:
             continue
 
         direction = trace_direction(
             skeleton,
-            int(y),
-            int(x)
+            y,
+            x
         )
 
         if direction is not None:
             endpoint_data.append(
                 {
-                    "x": int(x),
-                    "y": int(y),
-                    "component": int(component_id),
+                    "x": x,
+                    "y": y,
+                    "component": component_id,
                     "direction": direction
                 }
             )
@@ -146,7 +150,126 @@ def get_endpoint_data(mask, labels):
     return endpoint_data
 
 
-def find_best_connection(endpoint_data):
+def get_line_pixels(first, second, shape):
+    x1, y1 = first
+    x2, y2 = second
+
+    rows, cols = line(
+        int(y1),
+        int(x1),
+        int(y2),
+        int(x2)
+    )
+
+    valid = (
+        (rows >= 0)
+        & (rows < shape[0])
+        & (cols >= 0)
+        & (cols < shape[1])
+    )
+
+    return rows[valid], cols[valid]
+
+
+def calculate_connection_scores(
+    first,
+    second,
+    labels,
+    probability,
+    largest_component_size
+):
+    difference = np.array(
+        [
+            second["x"] - first["x"],
+            second["y"] - first["y"]
+        ],
+        dtype=float
+    )
+
+    distance = np.linalg.norm(difference)
+
+    if distance == 0:
+        return None
+
+    connection_direction = difference / distance
+
+    first_alignment = np.dot(
+        first["direction"],
+        connection_direction
+    )
+
+    second_alignment = np.dot(
+        second["direction"],
+        -connection_direction
+    )
+
+    if (
+        first_alignment < DIRECTION_THRESHOLD
+        or second_alignment < DIRECTION_THRESHOLD
+    ):
+        return None
+
+    direction_score = np.clip(
+        (first_alignment + second_alignment) / 2.0,
+        0.0,
+        1.0
+    )
+
+    distance_score = np.clip(
+        1.0 - distance / MAX_GAP,
+        0.0,
+        1.0
+    )
+
+    rows, cols = get_line_pixels(
+        (first["x"], first["y"]),
+        (second["x"], second["y"]),
+        probability.shape
+    )
+
+    if len(rows) == 0:
+        return None
+
+    confidence_score = float(
+        probability[rows, cols].mean()
+    )
+
+    first_size = int(
+        np.sum(labels == first["component"])
+    )
+
+    second_size = int(
+        np.sum(labels == second["component"])
+    )
+
+    merged_size = first_size + second_size
+
+    connectivity_score = np.clip(
+        merged_size / max(largest_component_size, 1),
+        0.0,
+        1.0
+    )
+
+    total_score = (
+        0.35 * direction_score
+        + 0.25 * distance_score
+        + 0.20 * confidence_score
+        + 0.20 * connectivity_score
+    )
+
+    return {
+        "first": (first["x"], first["y"]),
+        "second": (second["x"], second["y"]),
+        "distance": float(distance),
+        "direction_score": float(direction_score),
+        "distance_score": float(distance_score),
+        "confidence_score": float(confidence_score),
+        "connectivity_score": float(connectivity_score),
+        "total_score": float(total_score)
+    }
+
+
+def find_best_connection(endpoint_data, labels, probability):
     if len(endpoint_data) < 2:
         return None
 
@@ -161,8 +284,12 @@ def find_best_connection(endpoint_data):
     tree = cKDTree(points)
     candidate_pairs = tree.query_pairs(MAX_GAP)
 
+    component_sizes = np.bincount(labels.ravel())
+    largest_component_size = int(
+        component_sizes[1:].max()
+    ) if len(component_sizes) > 1 else 1
+
     best_connection = None
-    best_score = -float("inf")
 
     for first_index, second_index in candidate_pairs:
         first = endpoint_data[first_index]
@@ -171,77 +298,71 @@ def find_best_connection(endpoint_data):
         if first["component"] == second["component"]:
             continue
 
-        difference = np.array(
-            [
-                second["x"] - first["x"],
-                second["y"] - first["y"]
-            ],
-            dtype=float
+        candidate = calculate_connection_scores(
+            first,
+            second,
+            labels,
+            probability,
+            largest_component_size
         )
 
-        distance = np.linalg.norm(difference)
-
-        if distance == 0:
+        if candidate is None:
             continue
 
-        connection_direction = difference / distance
-
-        alignment_first = np.dot(
-            first["direction"],
-            connection_direction
-        )
-
-        alignment_second = np.dot(
-            second["direction"],
-            -connection_direction
-        )
+        if candidate["total_score"] < MIN_REPAIR_SCORE:
+            continue
 
         if (
-            alignment_first < DIRECTION_THRESHOLD
-            or alignment_second < DIRECTION_THRESHOLD
+            best_connection is None
+            or candidate["total_score"]
+            > best_connection["total_score"]
         ):
-            continue
-
-        score = (
-            alignment_first
-            + alignment_second
-            - distance / MAX_GAP
-        )
-
-        if score > best_score:
-            best_score = score
-            best_connection = (
-                (first["x"], first["y"]),
-                (second["x"], second["y"]),
-                distance
-            )
+            best_connection = candidate
 
     return best_connection
 
 
+def draw_connection(mask, connection):
+    image = Image.fromarray(
+        (mask.astype(np.uint8) * 255),
+        mode="L"
+    )
+
+    drawing = ImageDraw.Draw(image)
+
+    drawing.line(
+        [
+            connection["first"],
+            connection["second"]
+        ],
+        fill=255,
+        width=LINE_WIDTH
+    )
+
+    return np.asarray(image) > 0
+
+
 def main():
     mask = np.asarray(
-        Image.open(INPUT_PATH).convert("L")
+        Image.open(INPUT_MASK).convert("L")
     ) > 0
 
     original_pixels = int(mask.sum())
 
+    probability = load_probability(mask)
+
     mask = filter_small_components(mask)
+    mask = closing(mask, disk(2))
 
-    mask = closing(
-        mask,
-        disk(2)
-    )
-
-    labels = label(
+    initial_labels = label(
         mask,
         connectivity=2
     )
 
-    components_before = int(labels.max())
-    connections_created = 0
+    components_before = int(initial_labels.max())
+    connections = []
 
-    for _ in range(MAX_CONNECTIONS):
+    for iteration in range(MAX_CONNECTIONS):
         labels = label(
             mask,
             connectivity=2
@@ -253,61 +374,71 @@ def main():
         )
 
         connection = find_best_connection(
-            endpoint_data
+            endpoint_data,
+            labels,
+            probability
         )
 
         if connection is None:
-            print("No more valid connections found.")
+            print("No more valid high-confidence connections found.")
             break
 
-        first, second, distance = connection
-
-        repaired_image = Image.fromarray(
-            (mask.astype(np.uint8) * 255),
-            mode="L"
-        )
-
-        draw = ImageDraw.Draw(
-            repaired_image
-        )
-
-        draw.line(
-            [first, second],
-            fill=255,
-            width=LINE_WIDTH
-        )
-
-        mask = np.asarray(
-            repaired_image
-        ) > 0
-
-        connections_created += 1
-
-        if connections_created % 10 == 0:
-            print(
-                f"Connections created: "
-                f"{connections_created}"
-            )
-
-    components_after = int(
-        label(
+        mask = draw_connection(
             mask,
-            connectivity=2
-        ).max()
+            connection
+        )
+
+        connections.append(connection)
+
+        print(
+            f"Connection {iteration + 1}: "
+            f"score={connection['total_score']:.3f}, "
+            f"confidence={connection['confidence_score']:.3f}, "
+            f"distance={connection['distance']:.1f}"
+        )
+
+    final_labels = label(
+        mask,
+        connectivity=2
     )
+
+    components_after = int(final_labels.max())
 
     Image.fromarray(
         (mask.astype(np.uint8) * 255),
         mode="L"
-    ).save(OUTPUT_PATH)
+    ).save(OUTPUT_MASK)
+
+    with open(
+        OUTPUT_CONNECTIONS,
+        "w",
+        newline=""
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "first",
+                "second",
+                "distance",
+                "direction_score",
+                "distance_score",
+                "confidence_score",
+                "connectivity_score",
+                "total_score"
+            ]
+        )
+
+        writer.writeheader()
+        writer.writerows(connections)
 
     print()
     print("Original predicted pixels:", original_pixels)
     print("Repaired predicted pixels:", int(mask.sum()))
     print("Components before repair:", components_before)
     print("Components after repair:", components_after)
-    print("Connections created:", connections_created)
-    print("Saved:", OUTPUT_PATH)
+    print("Connections created:", len(connections))
+    print("Saved:", OUTPUT_MASK)
+    print("Saved:", OUTPUT_CONNECTIONS)
 
 
 if __name__ == "__main__":

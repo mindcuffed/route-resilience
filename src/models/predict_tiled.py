@@ -1,4 +1,5 @@
 import csv
+
 import numpy as np
 import rasterio
 import torch
@@ -13,6 +14,7 @@ MODEL_PATH = r"outputs\unet_best.pt"
 
 OUTPUT_MASK = r"outputs\predicted_tiled_mask.png"
 OUTPUT_OVERLAY = r"outputs\predicted_tiled_overlay.png"
+OUTPUT_PROBABILITY = r"outputs\predicted_tiled_probability.npy"
 
 TILE_SIZE = 512
 STRIDE = 384
@@ -130,7 +132,6 @@ def main():
     ]
 
     selected_row = test_rows[0]
-
     image_path = selected_row["image_path"]
 
     print("Input image:", image_path)
@@ -151,6 +152,11 @@ def main():
     probability = predict_tiled(
         model,
         image
+    )
+
+    np.save(
+        OUTPUT_PROBABILITY,
+        probability
     )
 
     prediction = probability > THRESHOLD
@@ -192,7 +198,9 @@ def main():
     )
 
     print("Probability maximum:", float(probability.max()))
+    print("Probability mean:", float(probability.mean()))
     print("Predicted road pixels:", int(prediction.sum()))
+    print("Saved:", OUTPUT_PROBABILITY)
     print("Saved:", OUTPUT_MASK)
     print("Saved:", OUTPUT_OVERLAY)
 
