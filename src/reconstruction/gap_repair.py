@@ -1,10 +1,8 @@
 import csv
-import math
 
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.spatial import cKDTree
-from skimage.draw import line
 from skimage.measure import label
 from skimage.morphology import closing, disk, remove_small_objects, skeletonize
 
@@ -16,9 +14,11 @@ OUTPUT_MASK = r"outputs\reconstruction_repaired.png"
 OUTPUT_CONNECTIONS = r"outputs\accepted_connections.csv"
 
 MIN_COMPONENT_SIZE = 100
-MAX_GAP = 120
+MAX_GAP = 80
 MAX_CONNECTIONS = 100
-MIN_REPAIR_SCORE = 0.65
+MIN_REPAIR_SCORE = 0.55
+MIN_PATH_CONFIDENCE = 0.30
+
 DIRECTION_THRESHOLD = 0.20
 LOOK_AHEAD = 15
 LINE_WIDTH = 3
@@ -29,13 +29,17 @@ def load_probability(mask):
         probability = np.load(INPUT_PROBABILITY)
 
         if probability.shape != mask.shape:
-            print("Probability map shape mismatch. Using binary mask confidence.")
+            print("Probability map shape mismatch.")
             return mask.astype(np.float32)
 
-        return np.clip(probability.astype(np.float32), 0.0, 1.0)
+        return np.clip(
+            probability.astype(np.float32),
+            0.0,
+            1.0
+        )
 
     except FileNotFoundError:
-        print("Probability map not found. Using binary mask confidence.")
+        print("Probability map not found.")
         return mask.astype(np.float32)
 
 
@@ -154,21 +158,33 @@ def get_line_pixels(first, second, shape):
     x1, y1 = first
     x2, y2 = second
 
-    rows, cols = line(
-        int(y1),
-        int(x1),
-        int(y2),
-        int(x2)
+    points = np.linspace(
+        0.0,
+        1.0,
+        max(
+            int(np.linalg.norm(
+                np.array(second) - np.array(first)
+            )),
+            2
+        )
     )
+
+    xs = np.rint(
+        x1 + points * (x2 - x1)
+    ).astype(int)
+
+    ys = np.rint(
+        y1 + points * (y2 - y1)
+    ).astype(int)
 
     valid = (
-        (rows >= 0)
-        & (rows < shape[0])
-        & (cols >= 0)
-        & (cols < shape[1])
+        (xs >= 0)
+        & (xs < shape[1])
+        & (ys >= 0)
+        & (ys < shape[0])
     )
 
-    return rows[valid], cols[valid]
+    return ys[valid], xs[valid]
 
 
 def calculate_connection_scores(
@@ -221,7 +237,7 @@ def calculate_connection_scores(
         1.0
     )
 
-    rows, cols = get_line_pixels(
+    rows, columns = get_line_pixels(
         (first["x"], first["y"]),
         (second["x"], second["y"]),
         probability.shape
@@ -231,8 +247,11 @@ def calculate_connection_scores(
         return None
 
     confidence_score = float(
-        probability[rows, cols].mean()
+        probability[rows, columns].mean()
     )
+
+    if confidence_score < MIN_PATH_CONFIDENCE:
+        return None
 
     first_size = int(
         np.sum(labels == first["component"])
@@ -258,8 +277,10 @@ def calculate_connection_scores(
     )
 
     return {
-        "first": (first["x"], first["y"]),
-        "second": (second["x"], second["y"]),
+        "first_x": first["x"],
+        "first_y": first["y"],
+        "second_x": second["x"],
+        "second_y": second["y"],
         "distance": float(distance),
         "direction_score": float(direction_score),
         "distance_score": float(distance_score),
@@ -284,10 +305,16 @@ def find_best_connection(endpoint_data, labels, probability):
     tree = cKDTree(points)
     candidate_pairs = tree.query_pairs(MAX_GAP)
 
-    component_sizes = np.bincount(labels.ravel())
+    component_sizes = np.bincount(
+        labels.ravel()
+    )
+
+    if len(component_sizes) <= 1:
+        return None
+
     largest_component_size = int(
         component_sizes[1:].max()
-    ) if len(component_sizes) > 1 else 1
+    )
 
     best_connection = None
 
@@ -332,8 +359,14 @@ def draw_connection(mask, connection):
 
     drawing.line(
         [
-            connection["first"],
-            connection["second"]
+            (
+                connection["first_x"],
+                connection["first_y"]
+            ),
+            (
+                connection["second_x"],
+                connection["second_y"]
+            )
         ],
         fill=255,
         width=LINE_WIDTH
@@ -359,7 +392,10 @@ def main():
         connectivity=2
     )
 
-    components_before = int(initial_labels.max())
+    components_before = int(
+        initial_labels.max()
+    )
+
     connections = []
 
     for iteration in range(MAX_CONNECTIONS):
@@ -380,7 +416,9 @@ def main():
         )
 
         if connection is None:
-            print("No more valid high-confidence connections found.")
+            print(
+                "No more valid high-confidence connections found."
+            )
             break
 
         mask = draw_connection(
@@ -402,7 +440,9 @@ def main():
         connectivity=2
     )
 
-    components_after = int(final_labels.max())
+    components_after = int(
+        final_labels.max()
+    )
 
     Image.fromarray(
         (mask.astype(np.uint8) * 255),
@@ -417,8 +457,10 @@ def main():
         writer = csv.DictWriter(
             file,
             fieldnames=[
-                "first",
-                "second",
+                "first_x",
+                "first_y",
+                "second_x",
+                "second_y",
                 "distance",
                 "direction_score",
                 "distance_score",
